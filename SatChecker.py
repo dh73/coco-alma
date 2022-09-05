@@ -32,7 +32,7 @@ class Formula:
 
         self.dbg_defmap = {}
 
-    def make_assumes(self, shares):
+    def make_act_assumes(self, shares):
         assume_act = {}
         for ss in sorted(list(shares.keys())):
             # if either all or none are active, there is a leak
@@ -129,7 +129,6 @@ class Formula:
         assert(gate_type in GATE_TYPES)
         # simple application of (a ^ a) == 0 and (a & a) == a
         if vars_id1 == vars_id2: return None if (gate_type in LINEAR_TYPES) else vars_id1
-
         l1 = self.linear_gate_set[vars_id1]
         l2 = self.linear_gate_set[vars_id2]
         n1 = self.nonlin_gate_set[vars_id1]
@@ -210,19 +209,21 @@ class Formula:
         self.add_cover(res.id, arg2)
         return res.id
 
-    def collect_active_time_constrained(self, mode, glitch_behavior, cycle):
+    def collect_active_time_constrained(self, mode, hamming, glitch_behavior, cycle, ignored):
         node_vars = self.node_vars_stable if (mode == STABLE) else self.node_vars_trans
         active = set()
         vars = node_vars[cycle].copy()
-        # if mode == TRANSIENT and glitch_behavior == LOOSE:
-        #     for node in vars.keys():
-        #         if node in self.node_vars_diff[cycle]:
-        #             vars[node] = self.make_choice(vars[node], self.node_vars_diff[cycle][node])
+        if hamming or (mode == TRANSIENT and glitch_behavior == LOOSE):
+            for node in vars.keys():
+                if node in self.node_vars_diff[cycle]:
+                    vars[node] = self.make_choice(vars[node], self.node_vars_diff[cycle][node])
 
         for node in vars.keys():
+            if node in ignored: continue
             self.vars_to_info[vars[node]] = VariableInfo(cycle, node)
             if vars[node] in self.covered_bot_vars: continue
             active.add(vars[node])
+
         return [(x,) for x in sorted(active)]
 
     def collect_active_classic(self, mode):
@@ -294,7 +295,7 @@ class Formula:
 
 
 class SatChecker(object):
-    def __init__(self, labels, trace, safe_graph, args):
+    def __init__(self, labels, ignored, trace, safe_graph, args):
         assert(args.mode in (TRANSIENT, STABLE))
 
         self.circuit = safe_graph
@@ -305,6 +306,7 @@ class SatChecker(object):
         self.order = args.order
         self.cycles = args.cycles
         self.from_cycle = args.from_cycle
+        self.hamming = args.hamming
         self.mode = args.mode
         self.glitch_behavior = args.glitch_behavior
         self.probing_model = args.probing_model
@@ -326,6 +328,7 @@ class SatChecker(object):
         self.var_indexes = {}
         self.pretty_names = []
         self.debugs = set(args.debugs)
+        self.ignored = ignored
         self.dbg_exact_formula = args.dbg_exact_formula
         self.checking_mode = args.checking_mode
         self.__extract_label_info(labels)
@@ -386,16 +389,7 @@ class SatChecker(object):
         type_ = self.circuit.cells[gate].type
         return self.__simple_inherit(type_, preds, curr_vars, info)
 
-    # @profile
-    def __proc_mux(self, mode, select, mux_ins, curr_vars, sel_stable=True):
-        assert(select is not None)
-        assert(len(mux_ins) == 2)
-        if select not in curr_vars.keys() and sel_stable:
-            sel_cell = self.circuit.cells[select]
-            value = self.trace.get_signal_value(sel_cell.name, sel_cell.pos)
-            assert(value in BIN_STR), "invalid select value is '%s'" % value
-            return curr_vars.get(mux_ins[int(value)])
-
+    def __make_mux_sel_not_stable(self, mode, mux_ins, curr_vars):
         vars_ = [curr_vars.get(m) for m in mux_ins]
         vars_ = [v for v in vars_ if v is not None]
         res_vars = None
@@ -406,9 +400,40 @@ class SatChecker(object):
                 res_vars = self.formula.make_choice(vars_[0], vars_[1])
             else:
                 res_vars = self.formula.make_simple(AND_TYPE, vars_[0], vars_[1])
+        return res_vars
 
-        if select not in curr_vars.keys(): return res_vars
+    # @profile
+    def __proc_mux(self, mode, select, mux_ins, curr_vars, sel_stable=True):
+        assert(select is not None)
+        assert(len(mux_ins) == 2)
+        if select not in curr_vars.keys():
+            if sel_stable:
+                sel_cell = self.circuit.cells[select]
+                value = self.trace.get_signal_value(sel_cell.name, sel_cell.pos)
+                assert(value in BIN_STR), "invalid select value is '%s'" % value
+                return curr_vars.get(mux_ins[int(value)])
+            else:
+                return self.__make_mux_sel_not_stable(mode, mux_ins, curr_vars)
+            assert(False)
+        res_vars = self.__make_mux_sel_not_stable(mode, mux_ins, curr_vars)
+        if res_vars is None: return curr_vars[select]
         return self.formula.make_simple(AND_TYPE, res_vars, curr_vars[select])
+
+    def __build_node_stable(self, node_id, curr_vars, prev_vars):
+        cell = self.circuit.cells[node_id]
+        nvars = None
+        if cell.type in GATE_TYPES:
+            nvars = self.__proc_simple(node_id, cell.type, curr_vars)
+        elif cell.type == NOT_TYPE or cell.type in REGISTER_TYPES:
+            if cell.type in REGISTER_TYPES and node_id in curr_vars: return None
+            target_vars = curr_vars if cell.type == NOT_TYPE else prev_vars
+            pred0 = self.circuit.predecessors(node_id).__next__()
+            nvars = target_vars.get(pred0)
+        elif cell.type == PORT_TYPE:
+            return None
+        elif cell.type == MUX_TYPE:
+            nvars = self.__proc_mux(STABLE, cell.select, cell.mux_ins, curr_vars)
+        return nvars
 
     # @profile
     def __build_stable(self):
@@ -418,19 +443,7 @@ class SatChecker(object):
             prev_vars = self.formula.node_vars_stable[-2]
 
         for node_id in self.circuit.nodes:
-            cell = self.circuit.cells[node_id]
-            nvars = None
-            if cell.type in GATE_TYPES:
-                nvars = self.__proc_simple(node_id, cell.type, curr_vars)
-            elif cell.type == NOT_TYPE or cell.type in REGISTER_TYPES:
-                if cell.type in REGISTER_TYPES and node_id in curr_vars: continue
-                target_vars = curr_vars if cell.type == NOT_TYPE else prev_vars
-                pred0 = self.circuit.predecessors(node_id).__next__()
-                nvars = target_vars.get(pred0)
-            elif cell.type == PORT_TYPE: continue
-            elif cell.type == MUX_TYPE:
-                nvars = self.__proc_mux(STABLE, cell.select, cell.mux_ins, curr_vars)
-
+            nvars = self.__build_node_stable(node_id, curr_vars, prev_vars)
             if nvars is not None: curr_vars[node_id] = nvars
         pass
 
@@ -506,9 +519,14 @@ class SatChecker(object):
         all_stable_nodes = set(curr_stable.keys()).union(prev_stable.keys())
         stability = self.__make_stability_info()
         for node_id in self.circuit.nodes:
+            if node_id in self.ignored:
+                if node_id in curr_stable: curr_vars[node_id] = curr_stable[node_id]
+                continue
+
             cell = self.circuit.cells[node_id]
             nvars = None
             preds = self.circuit.predecessors(node_id)
+
             if cell.type in GATE_TYPES:
                 info = {p: ((p not in all_stable_nodes) and (self.trace_stable or stability[p])) for p in preds}
                 type_ = cell.type if (self.glitch_behavior == LOOSE) else AND_TYPE
@@ -549,7 +567,6 @@ class SatChecker(object):
             if (self.circuit.cells[var].type in REGISTER_TYPES) and cycle != 0: continue
             if cycle == 0:
                 self.__init_propvarset(var_idx, var)
-
                 # DEBUG
                 gate_vars_id = self.formula.node_vars_stable[-1][var]
                 self.formula.dbg_defmap[gate_vars_id] = (self.pretty_names[var_idx])
@@ -580,6 +597,7 @@ class SatChecker(object):
         curr_diff = self.formula.node_vars_diff[-1]
         for node_id in prev_stable:
             if node_id not in curr_stable: continue
+            if prev_stable[node_id] == curr_stable[node_id]: continue
             nvars = self.formula.make_simple(XOR_TYPE, prev_stable[node_id], curr_stable[node_id])
             if nvars is None: continue
             curr_diff[node_id] = nvars
@@ -588,20 +606,33 @@ class SatChecker(object):
         print("RST value: ", self.trace.get_signal_value(self.rst_name, 0))
         print(reset)
         assert (self.trace.get_signal_value(self.rst_name, 0) == reset)
+        self.__init_cycle(cycle)
+        print("Building formula for cycle %d: " % cycle)
+
         for dbg_name in self.debugs:
             try:
                 res = int(self.trace.get_signal_value(dbg_name, None), 2)
                 print("debug: %s = %x" % (dbg_name, res))
             except Exception as e:
-                print("%s\ncannot find %s" % (e, dbg_name))
+                # print("%s\ncannot find %s" % (e, dbg_name))
                 pass
-        self.__init_cycle(cycle)
-        print("Building formula for cycle %d: " % cycle, end="")
+
         self.__build_stable()
         if self.mode == TRANSIENT:
             self.__build_trans()
-            # if self.glitch_behavior == LOOSE and cycle > 0:
-            #     self.__build_hamming()
+        if self.mode == STABLE and self.hamming and cycle > 0:
+            self.__build_hamming()
+        target_vars = self.formula.node_vars_stable[-1]
+        if self.mode == TRANSIENT:
+            target_vars = self.formula.node_vars_trans[-1]
+        for node_id in target_vars:
+            cell = self.circuit.cells[node_id]
+            for debug in self.debugs:
+                if debug in cell.name:
+                    print(cell, self.formula.prop_var_sets[target_vars[node_id]])
+
+        # if self.glitch_behavior == LOOSE and cycle > 0:
+        #     self.__build_hamming()
 
         #DEBUG
         if self.dbg_exact_formula:
@@ -619,7 +650,7 @@ class SatChecker(object):
             cycle += 1
         self.cycles = cycle
 
-    def __get_assumes(self, ss, assume_act):
+    def __get_assumes_per_secret(self, ss, assume_act):
         assumes = [self.formula.check_vars[share] for share in self.shares[ss]]
         assumes += [assume_act[ss_] for ss_ in self.shares if ss != ss_]
         return assumes
@@ -758,7 +789,7 @@ class SatChecker(object):
         for cycle in cone.keys(): cone_nodes = cone_nodes.union(cone[cycle])
         self.__dbg_draw_dot(leak_num, cone_nodes, predecessors, location)
 
-    def get_assumes(self, pvs: PropVarSet):
+    def __get_assumes_per_location(self, pvs: PropVarSet):
         act_assumes = []
         positive = []
         trivial = False
@@ -847,13 +878,16 @@ class SatChecker(object):
         if "1" in mask_assumes: return None
         mask_assumes = [-x for x in mask_assumes if type(x) != str]
 
-        act_assumes, positive = self.get_assumes(pvs)
+        act_assumes, positive = self.__get_assumes_per_location(pvs)
         # trivial case, no complete secrets
         if act_assumes is None: return None
 
         assumes = mask_assumes + act_assumes
         if self.probing_model == TIME_CONSTRAINED:
             cells = [self.circuit.cells[ai.cell_id] for ai in var_infos]
+            for vi in var_infos:
+                target = self.formula.node_vars_trans if self.mode == TRANSIENT else self.formula.node_vars_stable
+                # print("check set %s:" % vi, self.formula.prop_var_sets[target[vi.cycle][vi.cell_id]])
             fmt_list = ["(cycle %d, %s)" % (vi.cycle, c) for vi, c in zip(var_infos, cells)]
         else:
             cell_ids = set(ai.cell_id for ai in var_infos)
@@ -918,7 +952,7 @@ class SatChecker(object):
         keys = list(active.keys())
         act_vars = [active[key].prop_var for key in keys]
         self.formula.solver.at_most_k_of_n(self.order, act_vars)
-        for var, var_idx in zip(self.variables, range(self.num_vars)):
+        for var_name, var_idx in self.var_indexes.items():
             ands = []
             for kid, key in enumerate(keys):
                 prp = self.formula.prop_var_sets[key][var_idx]
@@ -929,7 +963,13 @@ class SatChecker(object):
                     self.formula.solver.add_clauses(
                         make_and_bool_(prp, act_vars[kid], c))
                     ands.append(c)
-            self.formula.check_vars[var] = self.formula.solver.xor_list(ands)
+            if len(ands) == 0:
+                print("Empty xor for variable index ", var_name)
+                x = self.formula.solver.get_var()
+                self.formula.solver.add_clause([-x])
+                self.formula.check_vars[var_name] = x
+            else:
+                self.formula.check_vars[var_name] = self.formula.solver.xor_list(ands)
         
     
 
@@ -955,7 +995,7 @@ class SatChecker(object):
 
             all_masks = self.__collect_masks(cycle + 1)
             prev_active += curr_active
-            curr_active = self.formula.collect_active_time_constrained(self.mode, self.glitch_behavior, cycle)
+            curr_active = self.formula.collect_active_time_constrained(self.mode, self.hamming, self.glitch_behavior, cycle, self.ignored)
 
             print("Checking cycle %d:" % cycle)
             if self.checking_mode == PER_SECRET:
@@ -971,11 +1011,11 @@ class SatChecker(object):
                         active[vars[node]] = ActiveInfo(cycle, node, self.formula.solver.get_var())
 
                 self.__make_checks(active)
-                assume_act = self.formula.make_assumes(self.shares)
+                assume_act = self.formula.make_act_assumes(self.shares)
                 self.formula.solver.add_clauses([[-self.formula.check_vars[m]] for m in all_masks])
                 check_fmt = "Checking secret %%%dd %%s: " % len(str(len(self.shares)))
                 for ss in sorted(list(self.shares.keys())):
-                    assumes = self.__get_assumes(ss, assume_act)
+                    assumes = self.__get_assumes_per_secret(ss, assume_act)
                     print(check_fmt % (ss, assumes[:self.order + 1]))
                     r = self.formula.solver.solve(assumes)
                     if not r: continue

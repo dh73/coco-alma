@@ -42,7 +42,8 @@ def parse_arguments():
                         help="The verification mode (default: %(default)s)")
     parser.add_argument("-g", "--glitch-behavior", dest="glitch_behavior",
                         required=False, default=STRICT, choices=[STRICT, LOOSE],
-                        help="Determines behavior of glitches. The 'strict' mode is the worst case, 'loose' is more realistic (default: %(default)s)")
+                        help="Determines behavior of glitches. The 'strict' mode is the worst case, 'loose' is more"
+                             "realistic (default: %(default)s)")
     parser.add_argument("-t", "--probing-model", dest="probing_model",
                         required=False, default=TIME_CONSTRAINED, choices=[CLASSIC, TIME_CONSTRAINED],
                         help="Specifies probing model in which checks are performed (default: %(default)s)")
@@ -53,10 +54,15 @@ def parse_arguments():
                         help="Tells the solver to find the smallest correlating linear combination")
     parser.set_defaults(minimize_leaks=True)
     parser.add_argument("--checking-mode", dest="checking_mode",
-                        required=False, default=PER_SECRET, choices=[PER_SECRET, PER_LOCATION], help="Specifies checking mode. 'per-secret' means one formula is built per secret and the solver identifies leaking probing locations. 'per-location' means one formula is built per potentially leaking probing locations and the solver identifies combinations of secrets causing leaks (default: %(default)s)." )
+                        required=False, default=PER_SECRET, choices=[PER_SECRET, PER_LOCATION],
+                        help="Specifies checking mode. 'per-secret' means one formula is built per secret and the"
+                        "solver identifies leaking probing locations. 'per-location' means one formula is built per" 
+                        "potentially leaking probing locations and the solver identifies combinations of secrets" 
+                        "causing leaks (default: %(default)s).")
     parser.add_argument("-n", "--num-leaks", dest="num_leaks",
                         required=False, type=int, default=1,
-                        help="Number of leakage locations to be reported if the circuit is insecure. (default: %(default)s)")
+                        help="Number of leakage locations to be reported if the circuit is insecure." 
+                             " (default: %(default)s)")
     parser.add_argument("-r", "--rst-name", dest="rst_name",
                         required=False, default="rst_i",
                         help="Name of the reset signal (default: %(default)s)")
@@ -66,21 +72,31 @@ def parse_arguments():
     parser.add_argument("-p", "--rst-phase", dest="rst_phase",
                         required=False, default="1", choices=BIN_STR,
                         help="Phase of the reset signal that triggers the reset (default: %(default)s)")
-    parser.add_argument("-d", "--dbg-output-dir", dest="dbg_output_dir_path", 
+    parser.add_argument("-d", "--dbg-output-dir", dest="dbg_output_dir_path",
                         required=False, default=TMP_DIR,
-                        help="Directory in which debug traces (dbg-label-trace-?.txt, dbg-circuit-?.dot) are written (default: %(default)s)")
+                        help="Directory in which debug traces (dbg-label-trace-?.txt, dbg-circuit-?.dot) "
+                             "are written (default: %(default)s)")
     parser.add_argument("-ds", "--dbg-signals", dest="debugs",
                         required=False, default=[], nargs="+", type=str,
                         help="List of debug signals whose values should be printed")
-
-    parser.add_argument("--dbg-exact-formula", action="store_true", dest="dbg_exact_formula", help="For each node, print exact formula.")
+    parser.add_argument("-is", "--ignored-signals", dest="ignored",
+                        required=False, default=[], nargs="+", type=str,
+                        help="Cells whose names contain these strings (and their logic cone) to be "
+                             "are forced to be stable and then ignored during checks")
+    parser.add_argument("-hd", "--include-hamming", action="store_true", dest="hamming",
+                        help="Include transition leakage in stable mode")
+    parser.set_defaults(hamming=False)
+    parser.add_argument("--dbg-exact-formula", action="store_true", dest="dbg_exact_formula",
+                        help="For each node, print exact formula.")
     parser.set_defaults(dbg_exact_formula=False)
-
-    parser.add_argument("--export-cnf", dest="export_cnf", action="store_true", help="Export CNF which needs to be solved for each secret to dbg_output_dir. This allows to use other solvers than CaDiCaL, e.g. Kissat." )
+    parser.add_argument("--export-cnf", dest="export_cnf", action="store_true", help="Export CNF which needs to be" 
+                        "solved for each secret to dbg_output_dir. This allows to use other solvers than" 
+                        "CaDiCaL, e.g. Kissat." )
     parser.set_defaults(export_cnf=False)
     parser.add_argument("--kissat", dest="kissat_bin_path",
                         required=False, type=helpers.ap_check_file_exists,
-                        help="Path to a the Kissat binary file. Note that for enabling solving with Kissat, you need to set the --export-cnf option.")
+                        help="Path to a the Kissat binary file. Note that for enabling solving with Kissat," 
+                             "you need to set the --export-cnf option.")
     parser.add_argument("--top-module", dest="top_module",
                         required=True, type=str,
                         help="Name of the top module")
@@ -90,13 +106,15 @@ def parse_arguments():
     if args.cycles <= 0:    args.cycles = UINT_MAX
     if args.num_leaks <= 0: args.num_leaks = UINT_MAX
     
-    #Unfortunately, ap_check_dir_exists does not work for optional parameters
+    # Unfortunately, ap_check_dir_exists does not work for optional parameters
     helpers.check_dir_exists(args.dbg_output_dir_path) 
 
     if args.export_cnf == True and args.probing_model == TIME_CONSTRAINED:
-        raise argparse.ArgumentTypeError("Cannot export CNF formulas for time-constrained probing model. Please use the --probing-model classic option.")
+        raise argparse.ArgumentTypeError("Cannot export CNF formulas for time-constrained probing model. " 
+                                         "Please use the --probing-model classic option.")
     if args.kissat_bin_path != None and args.export_cnf == False:
-        raise argparse.ArgumentTypeError("Cannot use Kissat without exporting CNF formulas. Please use the --export-cnf option." % dir_path)
+        raise argparse.ArgumentTypeError("Cannot use Kissat without exporting CNF formulas. "
+                                         "Please use the --export-cnf option.")
 
     return args
 
@@ -149,6 +167,28 @@ def generate_labeling(label_file_path, json_module):
     return label_dict
 
 
+def generate_ignored(circuit, json_module, ignored_strings):
+    net_bits, _, _ = helpers.bit_to_net(json_module)
+    ignored = set()
+    for fs in ignored_strings:
+        for name in net_bits:
+            if fs not in name: continue
+            for b in net_bits[name]:
+                if type(b) is int:
+                    ignored.add(b)
+
+    for node_id in circuit.nodes:
+        preds = tuple(circuit.predecessors(node_id))
+        if len(preds) == 0: continue
+        if all(map(lambda p: p in ignored, preds)):
+            ignored.add(node_id)
+
+    for node_id in ignored:
+        print(circuit.cells[node_id])
+
+    return ignored
+
+
 def vcd_json_sanity_check(trace, circuit_graph, rst_name):
     assert(rst_name in trace.name_to_id), "Reset signal %s not recognized." % (rst_name)
     for node in circuit_graph.nodes():
@@ -164,13 +204,14 @@ def pretty_error(checker, cycle, cell):
 
     stable = checker.formula.node_vars_stable[cycle]
     trans = checker.formula.node_vars_trans[cycle] if checker.mode == TRANSIENT else None
+    hamming = checker.formula.node_vars_diff[cycle] if checker.hamming else None
     model = set(checker.formula.solver.get_model())
 
     for node_id in checker.circuit.nodes:
         node_cell = checker.circuit.cells[node_id]
         if node_cell != cell: continue
 
-        for mode, mstr in zip((stable, trans), ("stable", "trans ")):
+        for mode, mstr in zip((stable, hamming, trans), ("stable ", "hamming", "trans  ")):
             if mode is None or node_id not in mode: continue
             res = checker.formula.model_for_vars(model, mode[node_id])
             # generate mappings for signals that contribute to the leak
@@ -192,8 +233,9 @@ def main():
 
     module = circuit_json["modules"][args.top_module]
     label_dict = generate_labeling(args.label_file_path, module)
+    ignored_set = generate_ignored(safe_graph, module, args.ignored)
     trace = VCDStorage(args.vcd_file_path)
-    checker = SatChecker(label_dict, trace, safe_graph, args)
+    checker = SatChecker(label_dict, ignored_set, trace, safe_graph, args)
 
     status, locations = checker.check()
     leaks = [l[1] for l in locations]
